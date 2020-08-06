@@ -541,9 +541,9 @@ public class QuantileDigest
         return Math.min(max, chosen.get());
     }
 
-    public int estimatedInMemorySizeInBytes()
+    public long estimatedInMemorySizeInBytes()
     {
-        return (int) (QUANTILE_DIGEST_SIZE +
+        return (QUANTILE_DIGEST_SIZE +
                 SizeOf.sizeOf(counts) +
                 SizeOf.sizeOf(levels) +
                 SizeOf.sizeOf(values) +
