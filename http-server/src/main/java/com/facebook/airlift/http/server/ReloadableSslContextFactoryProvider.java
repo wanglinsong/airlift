@@ -3,17 +3,40 @@ package com.facebook.airlift.http.server;
 import com.facebook.airlift.http.server.HttpServer.ClientCertificate;
 import com.facebook.airlift.log.Logger;
 import com.facebook.airlift.security.pem.PemReader;
+import com.google.common.collect.ImmutableList;
+import com.google.common.hash.HashCode;
+import com.google.common.io.Files;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 
+import javax.security.auth.x500.X500Principal;
+
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
 import java.security.KeyStore;
+import java.security.SecureRandom;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
+import java.time.LocalDate;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ScheduledExecutorService;
 
+import static com.facebook.airlift.security.cert.CertificateBuilder.certificateBuilder;
+import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.hash.Hashing.sha256;
 import static java.lang.Math.toIntExact;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.time.temporal.ChronoUnit.YEARS;
+import static java.util.Collections.list;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
@@ -27,78 +50,35 @@ final class ReloadableSslContextFactoryProvider
 
     private final SslContextFactory.Server sslContextFactory;
 
-    private final List<String> includedCipherSuites;
-    private final List<String> excludedCipherSuites;
-
-    private final String keystorePath;
+    private final Optional<FileWatch> keystoreFile;
     private final String keystorePassword;
     private final String keyManagerPassword;
 
-    private final String trustStorePath;
+    private final String automaticHttpsSharedSecret;
+    private final String environment;
+
+    private final Optional<FileWatch> trustStoreFile;
     private final String trustStorePassword;
 
-    private final String secureRandomAlgorithm;
-
-    private final int sslSessionTimeoutSeconds;
-    private final int sslSessionCacheSize;
-
-    private final ClientCertificate clientCertificate;
-
-    public ReloadableSslContextFactoryProvider(HttpServerConfig config, ScheduledExecutorService scheduledExecutor, ClientCertificate clientCertificate)
+    public ReloadableSslContextFactoryProvider(HttpsConfig config, ScheduledExecutorService scheduledExecutor, ClientCertificate clientCertificate, String environment)
     {
         requireNonNull(config, "config is null");
         requireNonNull(scheduledExecutor, "scheduledExecutor is null");
 
-        includedCipherSuites = config.getHttpsIncludedCipherSuites();
-        excludedCipherSuites = config.getHttpsExcludedCipherSuites();
-
-        keystorePath = config.getKeystorePath();
+        keystoreFile = Optional.ofNullable(config.getKeystorePath()).map(File::new).map(FileWatch::new);
         keystorePassword = config.getKeystorePassword();
         keyManagerPassword = config.getKeyManagerPassword();
 
-        trustStorePath = config.getTrustStorePath();
+        automaticHttpsSharedSecret = config.getAutomaticHttpsSharedSecret();
+        this.environment = requireNonNull(environment, "environment is null");
+
+        trustStoreFile = Optional.ofNullable(config.getTrustStorePath()).map(File::new).map(FileWatch::new);
         trustStorePassword = config.getTrustStorePassword();
 
-        secureRandomAlgorithm = config.getSecureRandomAlgorithm();
-        sslSessionTimeoutSeconds = toIntExact(config.getSslSessionTimeout().roundTo(SECONDS));
-        sslSessionCacheSize = config.getSslSessionCacheSize();
-
-        this.clientCertificate = requireNonNull(clientCertificate, "clientCertificate is null");
-
-        this.sslContextFactory = buildContextFactory();
-        long refreshTime = config.getSslContextRefreshTime().toMillis();
-        scheduledExecutor.scheduleWithFixedDelay(this::reload, refreshTime, refreshTime, MILLISECONDS);
-    }
-
-    private SslContextFactory.Server buildContextFactory()
-    {
-        SslContextFactory.Server sslContextFactory = new SslContextFactory.Server();
-        Optional<KeyStore> pemKeyStore = tryLoadPemKeyStore(keystorePath, keystorePassword);
-        if (pemKeyStore.isPresent()) {
-            sslContextFactory.setKeyStore(pemKeyStore.get());
-            sslContextFactory.setKeyStorePassword("");
-        }
-        else {
-            sslContextFactory.setKeyStorePath(keystorePath);
-            sslContextFactory.setKeyStorePassword(keystorePassword);
-            if (keyManagerPassword != null) {
-                sslContextFactory.setKeyManagerPassword(keyManagerPassword);
-            }
-        }
-        if (trustStorePath != null) {
-            Optional<KeyStore> pemTrustStore = tryLoadPemTrustStore(trustStorePath);
-            if (pemTrustStore.isPresent()) {
-                sslContextFactory.setTrustStore(pemTrustStore.get());
-                sslContextFactory.setTrustStorePassword("");
-            }
-            else {
-                sslContextFactory.setTrustStorePath(trustStorePath);
-                sslContextFactory.setTrustStorePassword(trustStorePassword);
-            }
-        }
-        sslContextFactory.setIncludeCipherSuites(includedCipherSuites.toArray(new String[0]));
-        sslContextFactory.setExcludeCipherSuites(excludedCipherSuites.toArray(new String[0]));
-        sslContextFactory.setSecureRandomAlgorithm(secureRandomAlgorithm);
+        sslContextFactory = new SslContextFactory.Server();
+        sslContextFactory.setIncludeCipherSuites(config.getHttpsIncludedCipherSuites().toArray(new String[0]));
+        sslContextFactory.setExcludeCipherSuites(config.getHttpsExcludedCipherSuites().toArray(new String[0]));
+        sslContextFactory.setSecureRandomAlgorithm(config.getSecureRandomAlgorithm());
         switch (clientCertificate) {
             case NONE:
                 // no changes
@@ -112,52 +92,142 @@ final class ReloadableSslContextFactoryProvider
             default:
                 throw new IllegalArgumentException("Unsupported client certificate value: " + clientCertificate);
         }
-        sslContextFactory.setSslSessionTimeout(sslSessionTimeoutSeconds);
-        sslContextFactory.setSslSessionCacheSize(sslSessionCacheSize);
+        sslContextFactory.setSslSessionTimeout(toIntExact(config.getSslSessionTimeout().roundTo(SECONDS)));
+        sslContextFactory.setSslSessionCacheSize(config.getSslSessionCacheSize());
+        loadContextFactory(sslContextFactory);
 
-        return sslContextFactory;
+        long refreshTime = config.getSslContextRefreshTime().toMillis();
+        scheduledExecutor.scheduleWithFixedDelay(this::reload, refreshTime, refreshTime, MILLISECONDS);
     }
 
-    private static Optional<KeyStore> tryLoadPemKeyStore(String path, String password)
+    private void loadContextFactory(SslContextFactory.Server sslContextFactory)
     {
-        File keyStoreFile = new File(path);
-        try {
-            if (!PemReader.isPem(keyStoreFile)) {
-                return Optional.empty();
-            }
+        KeyStore keyStore = loadKeyStore(keystoreFile.map(FileWatch::getFile), keystorePassword, keyManagerPassword);
+
+        String password = "";
+        if (keyManagerPassword != null) {
+            password = keyManagerPassword;
         }
-        catch (IOException e) {
-            throw new IllegalArgumentException("Error reading key store file: " + keyStoreFile, e);
+        else if (keystorePassword != null) {
+            password = keystorePassword;
         }
 
-        try {
-            return Optional.of(PemReader.loadKeyStore(keyStoreFile, keyStoreFile, Optional.ofNullable(password)));
+        if (automaticHttpsSharedSecret != null) {
+            addAutomaticKeyForCurrentNode(automaticHttpsSharedSecret, keyStore, environment, password);
         }
-        catch (IOException | GeneralSecurityException e) {
-            throw new IllegalArgumentException("Error loading PEM key store: " + keyStoreFile, e);
+
+        sslContextFactory.setKeyStore(keyStore);
+        sslContextFactory.setKeyStorePassword(password);
+
+        if (trustStoreFile.isPresent()) {
+            sslContextFactory.setTrustStore(loadTrustStore(trustStoreFile.get().getFile(), trustStorePassword));
+            sslContextFactory.setTrustStorePassword("");
+        }
+        else {
+            // Backwards compatibility for with Jetty's internal behavior
+            sslContextFactory.setTrustStore(keyStore);
+            sslContextFactory.setKeyStorePassword(password);
         }
     }
 
-    private static Optional<KeyStore> tryLoadPemTrustStore(String path)
+    public static void addAutomaticKeyForCurrentNode(String sharedSecret, KeyStore keyStore, String commonName, String keyManagerPassword)
     {
-        File trustStoreFile = new File(path);
         try {
-            if (!PemReader.isPem(trustStoreFile)) {
-                return Optional.empty();
+            byte[] seed = sharedSecret.getBytes(UTF_8);
+            SecureRandom secureRandom = SecureRandom.getInstance("SHA1PRNG");
+            secureRandom.setSeed(seed);
+
+            KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+            generator.initialize(2048, secureRandom);
+            KeyPair keyPair = generator.generateKeyPair();
+
+            X500Principal subject = new X500Principal("CN=" + commonName);
+            LocalDate notBefore = LocalDate.now();
+            LocalDate notAfter = notBefore.plus(10, YEARS);
+            X509Certificate certificateServer = certificateBuilder()
+                    .setKeyPair(keyPair)
+                    .setSerialNumber(System.currentTimeMillis())
+                    .setIssuer(subject)
+                    .setNotBefore(notBefore)
+                    .setNotAfter(notAfter)
+                    .setSubject(subject)
+                    .addSanIpAddresses(getAllLocalIpAddresses())
+                    .buildSelfSigned();
+
+            char[] password = keyManagerPassword == null ? new char[0] : keyManagerPassword.toCharArray();
+            keyStore.setKeyEntry(commonName, keyPair.getPrivate(), password, new Certificate[] {certificateServer});
+        }
+        catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static List<InetAddress> getAllLocalIpAddresses()
+            throws SocketException
+    {
+        ImmutableList.Builder<InetAddress> list = ImmutableList.builder();
+        for (NetworkInterface networkInterface : list(NetworkInterface.getNetworkInterfaces())) {
+            for (InetAddress address : list(networkInterface.getInetAddresses())) {
+                if (!address.isAnyLocalAddress() && !address.isLinkLocalAddress() && !address.isMulticastAddress()) {
+                    list.add(address);
+                }
             }
         }
-        catch (IOException e) {
-            throw new IllegalArgumentException("Error reading trust store file: " + trustStoreFile, e);
+        return list.build();
+    }
+
+    private static KeyStore loadKeyStore(Optional<File> keystoreFile, String keystorePassword, String keyManagerPassword)
+    {
+        if (!keystoreFile.isPresent()) {
+            try {
+                KeyStore keyStore = KeyStore.getInstance("JKS");
+                keyStore.load(null, new char[0]);
+                return keyStore;
+            }
+            catch (GeneralSecurityException | IOException e) {
+                throw new RuntimeException(e);
+            }
         }
 
+        File file = keystoreFile.get();
         try {
-            if (PemReader.readCertificateChain(trustStoreFile).isEmpty()) {
-                throw new IllegalArgumentException("PEM trust store file does not contain any certificates: " + trustStoreFile);
+            if (PemReader.isPem(file)) {
+                checkArgument(keyManagerPassword == null, "key manager password is not allowed with a PEM keystore");
+                return PemReader.loadKeyStore(file, file, Optional.ofNullable(keystorePassword), true);
             }
-            return Optional.of(PemReader.loadTrustStore(trustStoreFile));
         }
         catch (IOException | GeneralSecurityException e) {
-            throw new IllegalArgumentException("Error loading PEM trust store: " + trustStoreFile, e);
+            throw new IllegalArgumentException("Error loading PEM key store: " + file, e);
+        }
+
+        try (InputStream in = new FileInputStream(file)) {
+            KeyStore keyStore = KeyStore.getInstance("JKS");
+            keyStore.load(in, keystorePassword.toCharArray());
+            return keyStore;
+        }
+        catch (IOException | GeneralSecurityException e) {
+            throw new IllegalArgumentException("Error loading Java key store: " + file, e);
+        }
+    }
+
+    private static KeyStore loadTrustStore(File truststoreFile, String truststorePassword)
+    {
+        try {
+            if (PemReader.isPem(truststoreFile)) {
+                return PemReader.loadTrustStore(truststoreFile);
+            }
+        }
+        catch (IOException | GeneralSecurityException e) {
+            throw new IllegalArgumentException("Error loading PEM trust store: " + truststoreFile, e);
+        }
+
+        try (InputStream in = new FileInputStream(truststoreFile)) {
+            KeyStore keyStore = KeyStore.getInstance("JKS");
+            keyStore.load(in, truststorePassword == null ? null : truststorePassword.toCharArray());
+            return keyStore;
+        }
+        catch (IOException | GeneralSecurityException e) {
+            throw new IllegalArgumentException("Error loading Java trust store: " + truststoreFile, e);
         }
     }
 
@@ -172,12 +242,65 @@ final class ReloadableSslContextFactoryProvider
     private synchronized void reload()
     {
         try {
-            SslContextFactory.Server updatedFactory = buildContextFactory();
-            updatedFactory.start();
-            this.sslContextFactory.reload(factory -> factory.setSslContext(updatedFactory.getSslContext()));
+            if (keystoreFile.map(FileWatch::updateState).orElse(false) || trustStoreFile.map(FileWatch::updateState).orElse(false)) {
+                sslContextFactory.reload(sslContextFactory -> loadContextFactory((SslContextFactory.Server) sslContextFactory));
+            }
         }
         catch (Exception e) {
             log.warn(e, "Unable to reload SslContext.");
+        }
+    }
+
+    private static class FileWatch
+    {
+        private final File file;
+        private long lastModified = -1;
+        private long length = -1;
+        private HashCode hashCode = sha256().hashBytes(new byte[0]);
+
+        public FileWatch(File file)
+        {
+            this.file = requireNonNull(file, "file is null");
+            updateState();
+        }
+
+        public File getFile()
+        {
+            return file;
+        }
+
+        public boolean updateState()
+        {
+            try {
+                // only check contents if length or modified time changed
+                long newLastModified = file.lastModified();
+                long newLength = file.length();
+                if (lastModified == newLastModified && length == newLength) {
+                    return false;
+                }
+
+                // update stats
+                lastModified = newLastModified;
+                length = newLength;
+
+                // check if contents changed
+                HashCode newHashCode = Files.asByteSource(file).hash(sha256());
+                if (Objects.equals(hashCode, newHashCode)) {
+                    return false;
+                }
+                hashCode = newHashCode;
+                return true;
+            }
+            catch (IOException e) {
+                // assume the file changed
+                return true;
+            }
+        }
+
+        @Override
+        public String toString()
+        {
+            return file.toString();
         }
     }
 }
