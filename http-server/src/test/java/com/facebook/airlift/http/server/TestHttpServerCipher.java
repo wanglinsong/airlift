@@ -14,7 +14,6 @@
 package com.facebook.airlift.http.server;
 
 import com.facebook.airlift.event.client.NullEventClient;
-import com.facebook.airlift.http.server.HttpServer.ClientCertificate;
 import com.facebook.airlift.node.NodeInfo;
 import com.facebook.airlift.tracetoken.TraceTokenManager;
 import com.google.common.collect.ImmutableMap;
@@ -32,7 +31,6 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 
 import static com.google.common.io.MoreFiles.deleteRecursively;
@@ -79,13 +77,12 @@ public class TestHttpServerCipher
     public void testIncludeCipherEmpty()
             throws Exception
     {
-        HttpServerConfig config = createHttpServerConfig();
-        HttpsConfig httpsConfig = createHttpsConfig()
+        HttpServerConfig config = createHttpServerConfig()
                 .setHttpsExcludedCipherSuites("")
                 .setHttpsIncludedCipherSuites(" ,   ");
         NodeInfo nodeInfo = new NodeInfo("test");
-        HttpServerInfo httpServerInfo = new HttpServerInfo(config, Optional.of(httpsConfig), nodeInfo);
-        HttpServer server = createServer(nodeInfo, httpServerInfo, config, httpsConfig);
+        HttpServerInfo httpServerInfo = new HttpServerInfo(config, nodeInfo);
+        HttpServer server = createServer(nodeInfo, httpServerInfo, config);
         try {
             server.start();
             URI httpsUri = httpServerInfo.getHttpsUri();
@@ -108,13 +105,12 @@ public class TestHttpServerCipher
     public void testIncludedCipher()
             throws Exception
     {
-        HttpServerConfig config = createHttpServerConfig();
-        HttpsConfig httpsConfig = createHttpsConfig()
+        HttpServerConfig config = createHttpServerConfig()
                 .setHttpsExcludedCipherSuites("")
                 .setHttpsIncludedCipherSuites(CIPHER_1 + "," + CIPHER_2);
         NodeInfo nodeInfo = new NodeInfo("test");
-        HttpServerInfo httpServerInfo = new HttpServerInfo(config, Optional.of(httpsConfig), nodeInfo);
-        HttpServer server = createServer(nodeInfo, httpServerInfo, config, httpsConfig);
+        HttpServerInfo httpServerInfo = new HttpServerInfo(config, nodeInfo);
+        HttpServer server = createServer(nodeInfo, httpServerInfo, config);
         try {
             server.start();
             URI httpsUri = httpServerInfo.getHttpsUri();
@@ -145,12 +141,11 @@ public class TestHttpServerCipher
     public void testExcludedCipher()
             throws Exception
     {
-        HttpServerConfig config = createHttpServerConfig();
-        HttpsConfig httpsConfig = createHttpsConfig()
+        HttpServerConfig config = createHttpServerConfig()
                 .setHttpsExcludedCipherSuites(CIPHER_1 + "," + CIPHER_2);
         NodeInfo nodeInfo = new NodeInfo("test");
-        HttpServerInfo httpServerInfo = new HttpServerInfo(config, Optional.of(httpsConfig), nodeInfo);
-        HttpServer server = createServer(nodeInfo, httpServerInfo, config, httpsConfig);
+        HttpServerInfo httpServerInfo = new HttpServerInfo(config, nodeInfo);
+        HttpServer server = createServer(nodeInfo, httpServerInfo, config);
 
         try {
             server.start();
@@ -179,21 +174,16 @@ public class TestHttpServerCipher
         return new HttpServerConfig()
                 .setHttpEnabled(false)
                 .setHttpsEnabled(true)
-                .setLogPath(new File(tempDir, "http-request.log").getAbsolutePath());
-    }
-
-    private static HttpsConfig createHttpsConfig()
-    {
-        return new HttpsConfig()
                 .setHttpsPort(0)
                 .setKeystorePath(KEY_STORE_PATH)
-                .setKeystorePassword(KEY_STORE_PASSWORD);
+                .setKeystorePassword(KEY_STORE_PASSWORD)
+                .setLogPath(new File(tempDir, "http-request.log").getAbsolutePath());
     }
 
     private static HttpClient createClientIncludeCiphers(String... includedCipherSuites)
             throws Exception
     {
-        SslContextFactory.Client sslContextFactory = new SslContextFactory.Client(true);
+        SslContextFactory sslContextFactory = new SslContextFactory();
         sslContextFactory.setIncludeCipherSuites(includedCipherSuites);
         // Since Jetty 9.4.12 the list of excluded cipher suites includes "^TLS_RSA_.*$" by default.
         // We reset that list here to enable use of those cipher suites.
@@ -205,28 +195,25 @@ public class TestHttpServerCipher
         return httpClient;
     }
 
-    private static HttpServer createServer(NodeInfo nodeInfo, HttpServerInfo httpServerInfo, HttpServerConfig config, HttpsConfig httpsConfig)
+    private static HttpServer createServer(NodeInfo nodeInfo, HttpServerInfo httpServerInfo, HttpServerConfig config)
     {
-        return createServer(new DummyServlet(), nodeInfo, httpServerInfo, config, httpsConfig);
+        return createServer(new DummyServlet(), nodeInfo, httpServerInfo, config);
     }
 
-    private static HttpServer createServer(HttpServlet servlet, NodeInfo nodeInfo, HttpServerInfo httpServerInfo, HttpServerConfig config, HttpsConfig httpsConfig)
+    private static HttpServer createServer(HttpServlet servlet, NodeInfo nodeInfo, HttpServerInfo httpServerInfo, HttpServerConfig config)
     {
         HashLoginServiceProvider loginServiceProvider = new HashLoginServiceProvider(config);
         HttpServerProvider serverProvider = new HttpServerProvider(
                 httpServerInfo,
                 nodeInfo,
                 config,
-                Optional.of(httpsConfig),
                 servlet,
                 ImmutableMap.of(),
                 ImmutableSet.of(new DummyFilter()),
                 ImmutableSet.of(),
                 ImmutableSet.of(),
-                ClientCertificate.NONE,
                 new RequestStats(),
-                new NullEventClient(),
-                Optional.empty());
+                new NullEventClient());
         serverProvider.setTheAdminServlet(new DummyServlet());
         serverProvider.setLoginService(loginServiceProvider.get());
         serverProvider.setTokenManager(new TraceTokenManager());

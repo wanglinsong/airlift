@@ -29,7 +29,6 @@ import javax.servlet.http.HttpServletResponse;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.PrintWriter;
 import java.security.Principal;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -38,7 +37,6 @@ import java.util.Set;
 import static com.google.common.io.ByteStreams.copy;
 import static com.google.common.io.ByteStreams.nullOutputStream;
 import static com.google.common.net.HttpHeaders.WWW_AUTHENTICATE;
-import static com.google.common.net.MediaType.PLAIN_TEXT_UTF_8;
 import static java.util.Objects.requireNonNull;
 import static javax.servlet.http.HttpServletResponse.SC_UNAUTHORIZED;
 
@@ -104,19 +102,7 @@ public class AuthenticationFilter
         if (messages.isEmpty()) {
             messages.add("Unauthorized");
         }
-
-        // The error string is used by clients for exception messages and
-        // is presented to the end user, thus it should be a single line.
-        String error = Joiner.on(" | ").join(messages);
-
-        // Clients should use the response body rather than the HTTP status
-        // message (which does not exist with HTTP/2), but the status message
-        // still needs to be sent for compatibility with existing clients.
-        response.setStatus(SC_UNAUTHORIZED, error);
-        response.setContentType(PLAIN_TEXT_UTF_8.toString());
-        try (PrintWriter writer = response.getWriter()) {
-            writer.write(error);
-        }
+        response.sendError(SC_UNAUTHORIZED, Joiner.on(" | ").join(messages));
     }
 
     private static ServletRequest withPrincipal(HttpServletRequest request, Principal principal)
